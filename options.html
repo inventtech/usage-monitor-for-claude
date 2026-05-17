@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Settings — Usage Monitor for Claude</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --fg: #1f2937;
+      --muted: #6b7280;
+      --border: #e5e7eb;
+      --green: #10a37f;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #1f2937;
+        --fg: #f3f4f6;
+        --muted: #9ca3af;
+        --border: #374151;
+      }
+    }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--fg);
+      max-width: 520px;
+      margin: 30px auto;
+      padding: 20px;
+    }
+    h1 { font-size: 20px; margin-top: 0; }
+    .field { margin-bottom: 18px; }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 4px;
+      font-size: 13px;
+    }
+    .hint {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 3px;
+    }
+    input[type="number"] {
+      width: 90px;
+      padding: 6px 8px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg);
+      color: var(--fg);
+      font-size: 13px;
+    }
+    .checkbox-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .checkbox-row label {
+      margin: 0;
+      font-weight: normal;
+    }
+    button {
+      padding: 8px 16px;
+      background: var(--green);
+      color: white;
+      border: 0;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    button:hover { opacity: 0.9; }
+    .saved {
+      display: inline-block;
+      margin-left: 10px;
+      color: var(--green);
+      font-size: 12px;
+      opacity: 0;
+      transition: opacity 0.2s;
+    }
+    .saved.show { opacity: 1; }
+    .note {
+      background: #fef3c7;
+      border-left: 3px solid #f59e0b;
+      padding: 10px 12px;
+      border-radius: 3px;
+      font-size: 12px;
+      line-height: 1.5;
+      margin-bottom: 20px;
+    }
+    @media (prefers-color-scheme: dark) {
+      .note { background: rgba(245, 158, 11, 0.15); color: var(--fg); }
+    }
+  </style>
+</head>
+<body>
+  <h1>⚙️ Usage Monitor for Claude — Settings</h1>
+
+  <div class="note">
+    <strong>Note:</strong> This extension uses your browser's claude.ai session
+    (Chrome attaches the cookie automatically — no setup required). If you don't
+    see usage data, please <a href="https://claude.ai" target="_blank">log in to
+    Claude.ai</a> first.
+  </div>
+
+  <div class="field">
+    <label for="refreshMinutes">Auto-refresh interval (minutes)</label>
+    <input type="number" id="refreshMinutes" min="1" max="60" />
+    <div class="hint">Minimum 1 minute. Default: 1 minute.</div>
+  </div>
+
+  <div class="field">
+    <label for="warnThreshold">Warning threshold (yellow)</label>
+    <input type="number" id="warnThreshold" min="0" max="100" /> %
+    <div class="hint">Badge turns yellow when usage exceeds this value</div>
+  </div>
+
+  <div class="field">
+    <label for="criticalThreshold">Critical threshold (red)</label>
+    <input type="number" id="criticalThreshold" min="0" max="100" /> %
+    <div class="hint">Badge turns red when usage exceeds this value + sends notification</div>
+  </div>
+
+  <div class="field">
+    <label>Notifications</label>
+    <div class="checkbox-row">
+      <input type="checkbox" id="notifyOnThreshold" />
+      <label for="notifyOnThreshold">Notify when usage crosses threshold</label>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="notifyOnIncident" />
+      <label for="notifyOnIncident">Notify when a new incident is reported</label>
+    </div>
+  </div>
+
+  <button id="saveBtn">Save</button>
+  <span class="saved" id="savedMsg">✓ Saved</span>
+
+  <script src="options.js"></script>
+</body>
+</html>
