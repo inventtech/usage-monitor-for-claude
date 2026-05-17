@@ -1,13 +1,14 @@
 // =========================================================
-// Usage Monitor for Claude - Background Service Worker (v1.6)
+// Usage Monitor for Claude - Background Service Worker (v1.6.4)
 // =========================================================
-// Changes from v1.1:
-//   - Try multiple endpoints for Free/Pro/Max and Enterprise
-//   - Robust parser: find usage windows in any nested structure
-//   - Separate endpoints for session limit / weekly limit / daily routine
-//   - Support different field names across plans
-//   - Store endpoint + raw response for debugging
-//   - v1.6: silent mode — no console output, swallow all uncaught errors
+// Changes:
+//   - v1.6.4: Popup now groups windows by section to match the layout of
+//             claude.ai/settings/usage: Plan / Weekly / Additional / Extra.
+//   - v1.6.3: Badge always shows 5-Hour Session (was max of all windows).
+//   - v1.6.2: Fix bug where utilization: 1 was misread as 100%.
+//   - v1.6.0: Silent mode — no console output, swallow uncaught errors
+//   - v1.5.0: rate_limit_tier → plan name (e.g. "Max (5x)"), english copy
+//   - v1.2.0: MAIN-world fetch sniffer for endpoint auto-discovery
 // =========================================================
 
 // Silence all uncaught errors and unhandled rejections so the extension
@@ -104,39 +105,20 @@ async function setState(patch) {
 function extractPercent(obj) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
 
-  // 1) Direct percent fields (0-100)
+  // 1) Direct percent fields (always 0-100, treated as a percent)
   for (const k of ['percent_used', 'percent', 'percentage', 'usage_percent', 'usage_percentage']) {
     if (typeof obj[k] === 'number') {
       const v = obj[k];
-      // > 1: confidently a percent
-      // <= 1: ambiguous (could be a fraction or just a tiny percent)
-      if (v > 1) return Math.round(v);
-      if (v === 0) return 0;
-      // 0 < v <= 1: try to disambiguate
-      // If used/limit are present, use those
-      const raw = extractRaw(obj);
-      if (raw && raw.limit > 0) {
-        return Math.min(100, Math.round((raw.used / raw.limit) * 100));
-      }
-      // 0-1 range: treat as fraction
-      return Math.round(v * 100);
+      if (!isFinite(v) || v < 0) return null;
+      return Math.min(100, Math.round(v));
     }
   }
 
-  // 2) utilization (Anthropic format: 0-100)
+  // 2) utilization (Anthropic format: always 0-100 as a percent, never a fraction)
   if (typeof obj.utilization === 'number') {
     const v = obj.utilization;
-    if (v === 0) return 0;
-    // utilization > 1: it is a percent
-    if (v > 1) return Math.min(100, Math.round(v));
-    // 0 < utilization <= 1: rare in Anthropic responses,
-    // but Enterprise may use fractions — disambiguate via other fields
-    const raw = extractRaw(obj);
-    if (raw && raw.limit > 0) {
-      return Math.min(100, Math.round((raw.used / raw.limit) * 100));
-    }
-    // fallback: treat as a fraction
-    return Math.round(v * 100);
+    if (!isFinite(v) || v < 0) return null;
+    return Math.min(100, Math.round(v));
   }
 
   // 3) used / limit
@@ -440,6 +422,47 @@ async function fetchUsage() {
   }
 
   // Dedup across endpoints — first occurrence wins
+  // Order windows to match the layout of claude.ai/settings/usage
+  // (Plan usage limits → Weekly limits → Additional features → Extra usage)
+  // Each window gets a `group` and `sortIndex` so the popup can section them out.
+  const ORDER = [
+    // Plan usage limits
+    { match: /^(5[- ]?hour|five[_ ]?hour|current[_ ]?session|session)$/i, group: 'plan', order: 0, groupLabel: 'Plan usage limits' },
+    // Weekly limits
+    { match: /weekly[_ ]?\(all[_ ]?models?\)|^(seven[_ ]?day|weekly|all[_ ]?models?)$/i, group: 'weekly', order: 10, groupLabel: 'Weekly limits' },
+    { match: /weekly[_ ]?\(sonnet\)|seven[_ ]?day[_ ]?sonnet|sonnet[_ ]?only/i, group: 'weekly', order: 11, groupLabel: 'Weekly limits' },
+    { match: /weekly[_ ]?\(opus\)|seven[_ ]?day[_ ]?opus|opus[_ ]?only/i, group: 'weekly', order: 12, groupLabel: 'Weekly limits' },
+    { match: /weekly[_ ]?\(haiku\)|seven[_ ]?day[_ ]?haiku|haiku[_ ]?only/i, group: 'weekly', order: 13, groupLabel: 'Weekly limits' },
+    { match: /claude[_ ]?design/i, group: 'weekly', order: 14, groupLabel: 'Weekly limits' },
+    { match: /weekly[_ ]?\(skills\)|seven[_ ]?day[_ ]?omelette/i, group: 'weekly', order: 15, groupLabel: 'Weekly limits' },
+    { match: /weekly[_ ]?\(cowork\)|seven[_ ]?day[_ ]?cowork/i, group: 'weekly', order: 16, groupLabel: 'Weekly limits' },
+    { match: /weekly[_ ]?\(oauth/i, group: 'weekly', order: 17, groupLabel: 'Weekly limits' },
+    // Additional features
+    { match: /routine[_ ]?runs?|daily/i, group: 'additional', order: 20, groupLabel: 'Additional features' },
+    // Extra usage
+    { match: /extra[_ ]?(usage|credit)/i, group: 'extra', order: 30, groupLabel: 'Extra usage' },
+  ];
+
+  function classify(w) {
+    const candidates = [w.label, w.rawLabel];
+    for (const rule of ORDER) {
+      for (const c of candidates) {
+        if (c && rule.match.test(c)) {
+          return { group: rule.group, sortIndex: rule.order, groupLabel: rule.groupLabel };
+        }
+      }
+    }
+    // Unknown: put it last under "Other"
+    return { group: 'other', sortIndex: 99, groupLabel: 'Other' };
+  }
+
+  for (const w of allWindows) {
+    const c = classify(w);
+    w.group = c.group;
+    w.sortIndex = c.sortIndex;
+    w.groupLabel = c.groupLabel;
+  }
+
   const dedup = new Map();
   for (const w of allWindows) {
     const key = w.label;
@@ -447,8 +470,8 @@ async function fetchUsage() {
   }
   const windows = Array.from(dedup.values());
 
-  // Sort: highest % first (so the most pressing usage shows up at the top)
-  windows.sort((a, b) => b.percent - a.percent);
+  // Sort by predefined order so popup matches claude.ai layout
+  windows.sort((a, b) => (a.sortIndex - b.sortIndex) || a.label.localeCompare(b.label));
 
   // Keep raw data around for the debug panel
   await setState({
@@ -519,6 +542,19 @@ async function fetchStatus() {
 }
 
 // -------------------- Badge --------------------
+// Pick the 5-Hour Session window for badge display.
+// Falls back to the highest-percent window if no 5-hour window exists.
+function pickBadgeWindow(windows) {
+  if (!windows || !windows.length) return null;
+  // Prefer the 5-hour session — that's the limit users feel most acutely
+  const fiveHour = windows.find(w =>
+    /5[- ]?hour|five[_ ]?hour|current[_ ]?session|session/i.test(w.rawLabel || w.label)
+  );
+  if (fiveHour) return fiveHour;
+  // Fallback: window with the highest percent
+  return windows.reduce((a, b) => (a.percent >= b.percent ? a : b));
+}
+
 async function updateBadge(usage, status, settings) {
   let text = '';
   let bgColor = '#10a37f';
@@ -529,7 +565,8 @@ async function updateBadge(usage, status, settings) {
     bgColor = '#dc2626';
     title = `🔴 ${status.description}`;
   } else if (usage && usage.windows?.length) {
-    const pct = usage.maxPercent;
+    const badgeWindow = pickBadgeWindow(usage.windows);
+    const pct = badgeWindow ? badgeWindow.percent : 0;
     text = pct >= 100 ? '100' : String(pct);
 
     if (pct >= settings.criticalThreshold) {
@@ -563,14 +600,19 @@ async function updateBadge(usage, status, settings) {
 // -------------------- Notifications --------------------
 async function maybeNotify(usage, status, prev, settings) {
   if (settings.notifyOnThreshold && usage && prev?.lastUsage) {
-    const oldPct = prev.lastUsage.maxPercent ?? 0;
-    const newPct = usage.maxPercent ?? 0;
+    // Use the 5-hour session for threshold alerts (matches the badge)
+    const oldWindow = prev.lastUsage.windows ? pickBadgeWindow(prev.lastUsage.windows) : null;
+    const newWindow = pickBadgeWindow(usage.windows || []);
+    const oldPct = oldWindow ? oldWindow.percent : 0;
+    const newPct = newWindow ? newWindow.percent : 0;
+    const label = newWindow ? newWindow.label : 'Usage';
+
     if (oldPct < settings.criticalThreshold && newPct >= settings.criticalThreshold) {
       chrome.notifications.create({
         type: 'basic',
         iconUrl: 'icons/icon128.png',
         title: '🔴 Claude Usage Critical',
-        message: `Usage has reached ${newPct}%`,
+        message: `${label} has reached ${newPct}%`,
         priority: 2,
       });
     } else if (oldPct < settings.warnThreshold && newPct >= settings.warnThreshold) {
@@ -578,7 +620,7 @@ async function maybeNotify(usage, status, prev, settings) {
         type: 'basic',
         iconUrl: 'icons/icon128.png',
         title: '⚠️ Claude Usage Warning',
-        message: `Usage has reached ${newPct}%`,
+        message: `${label} has reached ${newPct}%`,
         priority: 1,
       });
     }

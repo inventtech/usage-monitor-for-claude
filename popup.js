@@ -90,21 +90,45 @@ async function renderInternal({ state, settings }) {
       <a href="https://claude.ai" target="_blank">Open Claude.ai to log in</a>
     </div>`;
   } else if (lastUsage?.windows?.length) {
+    // Group windows by their `group` field (set in background.js)
+    const groups = new Map();
     for (const w of lastUsage.windows) {
-      const color = colorForPercent(w.percent, settings);
-      const width = Math.min(100, Math.max(2, w.percent));
-      const rawText = w.raw ? ` <span style="color:var(--muted);font-size:10px;">(${w.raw.used} / ${w.raw.limit})</span>` : '';
-      html += `
-        <div class="window">
-          <div class="window-row">
-            <span class="window-label">${escapeHtml(w.label)}${rawText}</span>
-            <span class="window-value" style="color:${color}">${w.percent}%</span>
-          </div>
-          <div class="bar">
-            <div class="bar-fill" style="width:${width}%;background:${color}"></div>
-          </div>
-          ${w.resetsAt ? `<div class="reset">${escapeHtml(formatResetTime(w.resetsAt))}</div>` : ''}
-        </div>`;
+      const key = w.group || 'other';
+      if (!groups.has(key)) {
+        groups.set(key, { label: w.groupLabel || 'Other', windows: [] });
+      }
+      groups.get(key).windows.push(w);
+    }
+
+    let isFirstGroup = true;
+    for (const { label: groupLabel, windows } of groups.values()) {
+      if (!isFirstGroup) {
+        html += `<div style="margin:10px 0 6px;font-weight:600;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;">${escapeHtml(groupLabel)}</div>`;
+      } else {
+        // First group: replace section title
+        html = html.replace(
+          '<div class="section-title">Usage</div>',
+          `<div class="section-title">${escapeHtml(groupLabel)}</div>`
+        );
+        isFirstGroup = false;
+      }
+
+      for (const w of windows) {
+        const color = colorForPercent(w.percent, settings);
+        const width = Math.min(100, Math.max(2, w.percent));
+        const rawText = w.raw ? ` <span style="color:var(--muted);font-size:10px;">(${w.raw.used} / ${w.raw.limit})</span>` : '';
+        html += `
+          <div class="window">
+            <div class="window-row">
+              <span class="window-label">${escapeHtml(w.label)}${rawText}</span>
+              <span class="window-value" style="color:${color}">${w.percent}%</span>
+            </div>
+            <div class="bar">
+              <div class="bar-fill" style="width:${width}%;background:${color}"></div>
+            </div>
+            ${w.resetsAt ? `<div class="reset">${escapeHtml(formatResetTime(w.resetsAt))}</div>` : ''}
+          </div>`;
+      }
     }
   } else if (lastUsage?.warning || (lastError?.usage && !hasCaptured)) {
     html += `<div class="error" style="background:rgba(245,158,11,0.15);border-left:3px solid var(--yellow);color:var(--fg);">
