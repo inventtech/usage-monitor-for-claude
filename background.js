@@ -1,7 +1,11 @@
 // =========================================================
-// Usage Monitor for Claude - Background Service Worker (v1.6.5)
+// Usage Monitor for Claude - Background Service Worker (v1.6.6)
 // =========================================================
 // Changes:
+//   - v1.6.6: Post-merge review follow-up — persist discovered endpoints,
+//             full discovery sweep (keeps /rate_limits plan tier), trailing
+//             refresh re-run, fetch timeouts, stale-data disclosure in popup,
+//             no status retention, incident seen-set fixes.
 //   - v1.6.5: Reliability fixes — capture relative URLs, keep cached usage
 //             across failed refreshes, single-flight refresh, stop sweeping
 //             fallback endpoints once a working endpoint is known.
@@ -89,14 +93,19 @@ async function recordCapturedEndpointNow(url, data) {
   try {
     // The page may fetch with a relative URL — resolve against claude.ai
     const u = new URL(url, 'https://claude.ai');
+
+    // Already-known path: nothing to learn. The sniffer fires on every
+    // usage-shaped call on any claude.ai page, so refreshing here would turn
+    // normal conversation traffic into constant fetch cycles.
+    if (captured[u.pathname]) return;
+
     captured[u.pathname] = {
       lastUrl: u.href,
       lastSeen: Date.now(),
-      sampleData: data, // keep sample to inspect structure
     };
     await chrome.storage.local.set({ capturedEndpoints: captured });
 
-    // Refresh immediately when fresh data arrives
+    // Refresh immediately when a new endpoint is learned
     refresh();
   } catch (_) {
     /* swallow */
@@ -357,15 +366,27 @@ function extractPlanName(orgsData, usageData) {
 }
 
 // -------------------- Usage Fetcher --------------------
+// A hung request must not wedge the single-flight refresh for the worker's
+// lifetime — cap every fetch. Guarded: AbortSignal.timeout needs Chrome 103+.
+const FETCH_TIMEOUT_MS = 20000;
+function fetchTimeoutSignal() {
+  try { return AbortSignal.timeout(FETCH_TIMEOUT_MS); } catch (_) { return undefined; }
+}
+
 async function fetchUsage() {
   // Step 1: get organizations
   const orgsResp = await fetch('https://claude.ai/api/organizations', {
     credentials: 'include',
     headers: { 'Accept': 'application/json' },
+    signal: fetchTimeoutSignal(),
   });
 
   if (orgsResp.status === 401 || orgsResp.status === 403) {
-    throw new Error('NOT_LOGGED_IN');
+    // A WAF/bot challenge also answers 401/403, but with an HTML body — only
+    // a JSON response is a real logged-out signal. NOT_LOGGED_IN is the one
+    // error that wipes the cached snapshot, so it must not misfire.
+    const contentType = orgsResp.headers.get('content-type') || '';
+    if (contentType.includes('json')) throw new Error('NOT_LOGGED_IN');
   }
   if (!orgsResp.ok) {
     throw new Error(`Organizations API: HTTP ${orgsResp.status}`);
@@ -377,23 +398,26 @@ async function fetchUsage() {
   }
   const orgId = orgs[0].uuid;
 
-  // Step 2: assemble the list of endpoints to try
-  // 1) captured endpoints (ground truth from settings/usage page)
-  // 2) known endpoints (hardcoded fallback, swept only while nothing works)
-  const stored = await chrome.storage.local.get('capturedEndpoints');
+  // Step 2: assemble the list of endpoints to try.
+  // Known paths = captured (sniffed from the usage page) ∪ discovered (found
+  // answering in an earlier fallback sweep). Endpoints are complementary —
+  // different ones carry different windows / the plan tier — so every known
+  // path is queried every tick; the window set stays stable across ticks.
+  const stored = await chrome.storage.local.get(['capturedEndpoints', 'discoveredEndpoints']);
   const captured = stored.capturedEndpoints || {};
+  const discovered = Array.isArray(stored.discoveredEndpoints) ? stored.discoveredEndpoints : [];
 
-  const capturedPaths = new Set();
-  for (const path of Object.keys(captured)) {
-    // Substitute the current orgId into the captured path
-    capturedPaths.add(path.replace(/\/organizations\/[^/]+\//, `/organizations/${orgId}/`));
-  }
-  const fallbackPaths = ALL_ENDPOINTS
-    .map(template => template.replace('{orgId}', orgId))
-    .filter(path => !capturedPaths.has(path));
+  // Substitute the current orgId into a stored path
+  const substituteOrg = (path) =>
+    path.replace(/\/organizations\/[^/]+\//, `/organizations/${orgId}/`);
+
+  const knownPaths = new Set();
+  for (const path of Object.keys(captured)) knownPaths.add(substituteOrg(path));
+  for (const path of discovered) knownPaths.add(substituteOrg(path));
 
   const triedResults = [];
   const errors = [];
+  const gonePaths = new Set();
 
   async function tryEndpoint(path) {
     const url = `https://claude.ai${path}`;
@@ -401,14 +425,17 @@ async function fetchUsage() {
       const resp = await fetch(url, {
         credentials: 'include',
         headers: { 'Accept': 'application/json' },
+        signal: fetchTimeoutSignal(),
       });
       if (resp.ok) {
         const data = await resp.json();
         const windows = findUsageWindows(data);
         // Tag each window with its origin endpoint (for debugging)
         for (const w of windows) w.fromEndpoint = url;
-        triedResults.push({ endpoint: url, data, windows });
-      } else if (resp.status !== 404) {
+        triedResults.push({ endpoint: url, path, data, windows });
+      } else if (resp.status === 404) {
+        gonePaths.add(path);
+      } else {
         errors.push(`${path} → HTTP ${resp.status}`);
       }
     } catch (e) {
@@ -416,19 +443,27 @@ async function fetchUsage() {
     }
   }
 
-  // Query every captured endpoint — different endpoints carry different
-  // windows / the plan tier, and this set mirrors what the real page calls.
-  for (const path of capturedPaths) await tryEndpoint(path);
+  for (const path of knownPaths) await tryEndpoint(path);
 
-  // Sweep the hardcoded list only while no window has been found, stopping at
-  // the first hit — a full sweep every minute is mostly guaranteed 404s and
-  // invites rate limiting on the user's own account.
-  if (!triedResults.some(r => r.windows.length)) {
-    for (const path of fallbackPaths) {
-      await tryEndpoint(path);
-      if (triedResults.some(r => r.windows.length)) break;
+  // Discovery sweep: only when no known endpoint answered at all (an HTTP-ok
+  // response with zero windows still counts as answering — an idle account
+  // must not re-trigger the sweep every tick). Sweep the whole list with no
+  // early break so complementary responses are not lost; answering endpoints
+  // are persisted below, so the full sweep does not repeat next tick.
+  if (triedResults.length === 0) {
+    for (const template of ALL_ENDPOINTS) {
+      const path = template.replace('{orgId}', orgId);
+      if (!knownPaths.has(path)) await tryEndpoint(path);
     }
   }
+
+  // Remember endpoints that answered; drop discovered ones that now 404.
+  await safe(async () => {
+    const nextDiscovered = new Set(discovered.map(substituteOrg));
+    for (const r of triedResults) nextDiscovered.add(r.path);
+    for (const path of gonePaths) nextDiscovered.delete(path);
+    await chrome.storage.local.set({ discoveredEndpoints: Array.from(nextDiscovered) });
+  });
 
   if (triedResults.length === 0) {
     throw new Error(
@@ -536,7 +571,9 @@ async function fetchUsage() {
 
 // -------------------- Status Fetcher --------------------
 async function fetchStatus() {
-  const resp = await fetch('https://status.claude.com/api/v2/summary.json');
+  const resp = await fetch('https://status.claude.com/api/v2/summary.json', {
+    signal: fetchTimeoutSignal(),
+  });
   if (!resp.ok) throw new Error(`Status API: HTTP ${resp.status}`);
   const data = await resp.json();
 
@@ -654,17 +691,24 @@ async function maybeNotify(usage, status, prev, settings) {
     }
   }
 
-  if (settings.notifyOnIncident && status) {
-    const prevIds = new Set(prev?.lastIncidentIds || []);
-    const newIncidents = (status.incidents || []).filter(i => !prevIds.has(i.id));
-    for (const inc of newIncidents) {
-      chrome.notifications.create(`incident-${inc.id}`, {
-        type: 'basic',
-        iconUrl: 'icons/icon128.png',
-        title: '🚨 Claude Incident',
-        message: inc.name,
-        priority: 2,
-      });
+  if (status) {
+    // The seen-set is maintained even while incident notifications are off —
+    // otherwise it freezes and re-enabling replays every incident opened in
+    // between. An unset seen-set (fresh install) seeds silently instead of
+    // toasting every incident already active.
+    const knownIds = prev?.lastIncidentIds;
+    if (settings.notifyOnIncident && Array.isArray(knownIds)) {
+      const prevIds = new Set(knownIds);
+      const newIncidents = (status.incidents || []).filter(i => !prevIds.has(i.id));
+      for (const inc of newIncidents) {
+        chrome.notifications.create(`incident-${inc.id}`, {
+          type: 'basic',
+          iconUrl: 'icons/icon128.png',
+          title: '🚨 Claude Incident',
+          message: inc.name,
+          priority: 2,
+        });
+      }
     }
     await setState({ lastIncidentIds: status.incidents.map(i => i.id) });
   }
@@ -694,30 +738,41 @@ async function doRefresh() {
     statusError = (e && e.message) ? e.message : 'unknown error';
   }
 
-  // Keep the cached snapshot across transient fetch failures — wiping it blanks
-  // the badge and resets the threshold-crossing check, so an alert that spans
-  // one failed tick would never fire. A real logout does clear it.
+  // Keep the cached usage snapshot across transient fetch failures — wiping it
+  // blanks the badge and resets the threshold-crossing check, so an alert that
+  // spans one failed tick would never fire. A real logout does clear it.
+  // Status is NOT retained: a cached major/critical snapshot would pin the
+  // badge red until the status API recovers, hiding the usage percent.
   const loggedOut = usageError === 'NOT_LOGGED_IN';
   const effectiveUsage = usage ?? (loggedOut ? null : prev.lastUsage ?? null);
-  const effectiveStatus = status ?? prev.lastStatus ?? null;
 
   await safe(() => setState({
     lastUsage: effectiveUsage,
-    lastStatus: effectiveStatus,
+    lastStatus: status,
     lastError: { usage: usageError, status: statusError, at: Date.now() },
   }));
 
-  await safe(() => updateBadge(effectiveUsage, effectiveStatus, settings));
+  await safe(() => updateBadge(effectiveUsage, status, settings));
   await safe(() => maybeNotify(usage, status, prev, settings));
 }
 
-// Single-flight: captures and alarms can trigger refresh concurrently; parallel
-// runs race on stored state and double-fire threshold notifications.
+// Single-flight with a trailing re-run: concurrent triggers race on stored
+// state and double-fire notifications, but a trigger landing mid-run (a fresh
+// capture, a settings change, the popup's Refresh) must not be dropped — it
+// queues one follow-up run that re-reads settings and endpoints.
 let refreshInFlight = null;
+let refreshQueued = false;
 function refresh() {
-  if (!refreshInFlight) {
-    refreshInFlight = doRefresh().finally(() => { refreshInFlight = null; });
+  if (refreshInFlight) {
+    refreshQueued = true;
+    return refreshInFlight;
   }
+  refreshInFlight = (async () => {
+    do {
+      refreshQueued = false;
+      await doRefresh();
+    } while (refreshQueued);
+  })().finally(() => { refreshInFlight = null; });
   return refreshInFlight;
 }
 
