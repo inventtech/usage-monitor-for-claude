@@ -1,2 +1,5 @@
 # Personal Claude Code config — contains machine-local permission settings
 .claude/
+
+# Chrome Web Store packages built locally
+*.zip
