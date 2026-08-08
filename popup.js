@@ -28,7 +28,7 @@ function formatResetTime(value) {
 
   const hours = Math.floor(diffMs / 3600000);
   const minutes = Math.floor((diffMs % 3600000) / 60000);
-  if (hours > 24) {
+  if (hours >= 24) {
     const days = Math.floor(hours / 24);
     return `Resets in ${days}d ${hours % 24}h`;
   }
@@ -95,6 +95,18 @@ async function renderInternal({ state, settings }) {
       <a href="https://claude.ai" target="_blank">Open Claude.ai to log in</a>
     </div>`;
   } else if (lastUsage?.windows?.length) {
+    // The background retains the last good snapshot across failed refreshes —
+    // when the latest refresh failed, disclose that these numbers are cached
+    // instead of presenting them as live.
+    if (lastError?.usage) {
+      html += `<div class="error" style="background:rgba(245,158,11,0.15);border-left:3px solid var(--yellow);color:var(--fg);">
+        ⚠️ Showing cached data — the last refresh failed.
+        <details style="margin-top:4px;font-size:11px;">
+          <summary style="cursor:pointer;color:var(--muted);">Show error</summary>
+          <pre style="background:var(--border);padding:6px;border-radius:3px;font-size:10px;overflow:auto;max-height:100px;">${escapeHtml(lastError.usage)}</pre>
+        </details>
+      </div>`;
+    }
     // Group windows by their `group` field (set in background.js)
     const groups = new Map();
     for (const w of lastUsage.windows) {
@@ -252,7 +264,9 @@ async function renderInternal({ state, settings }) {
     });
   }
 
-  const updatedAt = Math.max(lastUsage?.fetchedAt || 0, lastStatus?.fetchedAt || 0);
+  // Age the footer off the usage data itself — a successful status fetch must
+  // not stamp a retained stale usage snapshot as freshly updated.
+  const updatedAt = lastUsage?.fetchedAt || lastStatus?.fetchedAt || 0;
   updatedEl.textContent = updatedAt
     ? `Last updated: ${formatRelativeTime(updatedAt)}`
     : '';

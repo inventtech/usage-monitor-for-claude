@@ -19,7 +19,7 @@ Development loop:
 3. Inspect the service worker via the "service worker" link on the extension card;
    inspect the popup via right-click → Inspect on the open popup.
 
-Releasing = bump `"version"` in `manifest.json` by hand (currently 1.6.5).
+Releasing = bump `"version"` in `manifest.json` by hand (currently 1.6.6).
 
 ## Architecture — the one thing to understand
 
