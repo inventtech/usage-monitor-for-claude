@@ -1,7 +1,10 @@
 // =========================================================
-// Usage Monitor for Claude - Background Service Worker (v1.6.4)
+// Usage Monitor for Claude - Background Service Worker (v1.6.5)
 // =========================================================
 // Changes:
+//   - v1.6.5: Reliability fixes — capture relative URLs, keep cached usage
+//             across failed refreshes, single-flight refresh, stop sweeping
+//             fallback endpoints once a working endpoint is known.
 //   - v1.6.4: Popup now groups windows by section to match the layout of
 //             claude.ai/settings/usage: Plan / Weekly / Additional / Extra.
 //   - v1.6.3: Badge always shows 5-Hour Session (was max of all windows).
@@ -68,15 +71,26 @@ async function getState() {
 
 // Track endpoints captured from the claude.ai/settings/usage page
 // (ground truth — endpoints the page actually uses)
-async function recordCapturedEndpoint(url, data) {
+// Writes are serialized: near-simultaneous captures share a read-modify-write
+// window on capturedEndpoints and would otherwise drop each other's entries.
+let captureWriteChain = Promise.resolve();
+function recordCapturedEndpoint(url, data) {
+  captureWriteChain = captureWriteChain
+    .then(() => recordCapturedEndpointNow(url, data))
+    .catch(() => {});
+  return captureWriteChain;
+}
+
+async function recordCapturedEndpointNow(url, data) {
   const state = await chrome.storage.local.get('capturedEndpoints');
   const captured = state.capturedEndpoints || {};
 
   // Store path part (so it works across organizations)
   try {
-    const u = new URL(url);
+    // The page may fetch with a relative URL — resolve against claude.ai
+    const u = new URL(url, 'https://claude.ai');
     captured[u.pathname] = {
-      lastUrl: url,
+      lastUrl: u.href,
       lastSeen: Date.now(),
       sampleData: data, // keep sample to inspect structure
     };
@@ -365,27 +379,23 @@ async function fetchUsage() {
 
   // Step 2: assemble the list of endpoints to try
   // 1) captured endpoints (ground truth from settings/usage page)
-  // 2) known endpoints (hardcoded list)
+  // 2) known endpoints (hardcoded fallback, swept only while nothing works)
   const stored = await chrome.storage.local.get('capturedEndpoints');
   const captured = stored.capturedEndpoints || {};
 
-  const endpointPaths = new Set();
-  // captured first
+  const capturedPaths = new Set();
   for (const path of Object.keys(captured)) {
     // Substitute the current orgId into the captured path
-    const normalized = path.replace(/\/organizations\/[^/]+\//, `/organizations/${orgId}/`);
-    endpointPaths.add(normalized);
+    capturedPaths.add(path.replace(/\/organizations\/[^/]+\//, `/organizations/${orgId}/`));
   }
-  // known
-  for (const template of ALL_ENDPOINTS) {
-    endpointPaths.add(template.replace('{orgId}', orgId));
-  }
+  const fallbackPaths = ALL_ENDPOINTS
+    .map(template => template.replace('{orgId}', orgId))
+    .filter(path => !capturedPaths.has(path));
 
-  // Try every endpoint
   const triedResults = [];
   const errors = [];
 
-  for (const path of endpointPaths) {
+  async function tryEndpoint(path) {
     const url = `https://claude.ai${path}`;
     try {
       const resp = await fetch(url, {
@@ -394,12 +404,29 @@ async function fetchUsage() {
       });
       if (resp.ok) {
         const data = await resp.json();
-        triedResults.push({ endpoint: url, data });
+        const windows = findUsageWindows(data);
+        // Tag each window with its origin endpoint (for debugging)
+        for (const w of windows) w.fromEndpoint = url;
+        triedResults.push({ endpoint: url, data, windows });
       } else if (resp.status !== 404) {
         errors.push(`${path} → HTTP ${resp.status}`);
       }
     } catch (e) {
       errors.push(`${path} → ${e.message}`);
+    }
+  }
+
+  // Query every captured endpoint — different endpoints carry different
+  // windows / the plan tier, and this set mirrors what the real page calls.
+  for (const path of capturedPaths) await tryEndpoint(path);
+
+  // Sweep the hardcoded list only while no window has been found, stopping at
+  // the first hit — a full sweep every minute is mostly guaranteed 404s and
+  // invites rate limiting on the user's own account.
+  if (!triedResults.some(r => r.windows.length)) {
+    for (const path of fallbackPaths) {
+      await tryEndpoint(path);
+      if (triedResults.some(r => r.windows.length)) break;
     }
   }
 
@@ -415,10 +442,7 @@ async function fetchUsage() {
   // Aggregate windows across all successful responses
   let allWindows = [];
   for (const r of triedResults) {
-    const ws = findUsageWindows(r.data);
-    // Tag each window with its origin endpoint (for debugging)
-    for (const w of ws) w.fromEndpoint = r.endpoint;
-    allWindows = allWindows.concat(ws);
+    allWindows = allWindows.concat(r.windows);
   }
 
   // Dedup across endpoints — first occurrence wins
@@ -477,7 +501,9 @@ async function fetchUsage() {
   await setState({
     lastRawUsage: {
       endpoints: triedResults.map(r => r.endpoint),
-      data: triedResults.length === 1 ? triedResults[0].data : triedResults,
+      data: triedResults.length === 1
+        ? triedResults[0].data
+        : triedResults.map(r => ({ endpoint: r.endpoint, data: r.data })),
       errors,
     }
   });
@@ -607,8 +633,10 @@ async function maybeNotify(usage, status, prev, settings) {
     const newPct = newWindow ? newWindow.percent : 0;
     const label = newWindow ? newWindow.label : 'Usage';
 
+    // Fixed notification ids so a repeat crossing replaces the toast
+    // instead of stacking duplicates.
     if (oldPct < settings.criticalThreshold && newPct >= settings.criticalThreshold) {
-      chrome.notifications.create({
+      chrome.notifications.create('usage-critical', {
         type: 'basic',
         iconUrl: 'icons/icon128.png',
         title: '🔴 Claude Usage Critical',
@@ -616,7 +644,7 @@ async function maybeNotify(usage, status, prev, settings) {
         priority: 2,
       });
     } else if (oldPct < settings.warnThreshold && newPct >= settings.warnThreshold) {
-      chrome.notifications.create({
+      chrome.notifications.create('usage-warn', {
         type: 'basic',
         iconUrl: 'icons/icon128.png',
         title: '⚠️ Claude Usage Warning',
@@ -648,7 +676,7 @@ async function safe(fn) {
   try { return await fn(); } catch (_) { return undefined; }
 }
 
-async function refresh() {
+async function doRefresh() {
   const settings = await safe(getSettings) ?? DEFAULT_SETTINGS;
   const prev = await safe(getState) ?? {};
 
@@ -666,14 +694,31 @@ async function refresh() {
     statusError = (e && e.message) ? e.message : 'unknown error';
   }
 
+  // Keep the cached snapshot across transient fetch failures — wiping it blanks
+  // the badge and resets the threshold-crossing check, so an alert that spans
+  // one failed tick would never fire. A real logout does clear it.
+  const loggedOut = usageError === 'NOT_LOGGED_IN';
+  const effectiveUsage = usage ?? (loggedOut ? null : prev.lastUsage ?? null);
+  const effectiveStatus = status ?? prev.lastStatus ?? null;
+
   await safe(() => setState({
-    lastUsage: usage,
-    lastStatus: status,
+    lastUsage: effectiveUsage,
+    lastStatus: effectiveStatus,
     lastError: { usage: usageError, status: statusError, at: Date.now() },
   }));
 
-  await safe(() => updateBadge(usage, status, settings));
+  await safe(() => updateBadge(effectiveUsage, effectiveStatus, settings));
   await safe(() => maybeNotify(usage, status, prev, settings));
+}
+
+// Single-flight: captures and alarms can trigger refresh concurrently; parallel
+// runs race on stored state and double-fire threshold notifications.
+let refreshInFlight = null;
+function refresh() {
+  if (!refreshInFlight) {
+    refreshInFlight = doRefresh().finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
 }
 
 async function setupAlarm() {

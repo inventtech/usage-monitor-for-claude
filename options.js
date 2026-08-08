@@ -27,12 +27,18 @@ async function load() {
   } catch (_) { /* ignore */ }
 }
 
+// parseInt + fallback that keeps an explicit 0 (`|| dflt` would discard it)
+function readInt(id, fallback) {
+  const v = parseInt(document.getElementById(id).value, 10);
+  return Number.isNaN(v) ? fallback : v;
+}
+
 async function save() {
   try {
     const settings = {
-      refreshMinutes: Math.max(1, parseInt(document.getElementById('refreshMinutes').value, 10) || 1),
-      warnThreshold: Math.max(0, Math.min(100, parseInt(document.getElementById('warnThreshold').value, 10) || 70)),
-      criticalThreshold: Math.max(0, Math.min(100, parseInt(document.getElementById('criticalThreshold').value, 10) || 90)),
+      refreshMinutes: Math.max(1, Math.min(60, readInt('refreshMinutes', DEFAULTS.refreshMinutes))),
+      warnThreshold: Math.max(0, Math.min(100, readInt('warnThreshold', DEFAULTS.warnThreshold))),
+      criticalThreshold: Math.max(0, Math.min(100, readInt('criticalThreshold', DEFAULTS.criticalThreshold))),
       notifyOnThreshold: document.getElementById('notifyOnThreshold').checked,
       notifyOnIncident: document.getElementById('notifyOnIncident').checked,
     };

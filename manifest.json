@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Usage Monitor for Claude",
-  "version": "1.6.4",
+  "version": "1.6.5",
   "description": "See your Claude.ai usage as a badge on your toolbar, like Gmail's unread count. Unofficial.",
   "permissions": [
     "storage",
