@@ -14,9 +14,14 @@ function colorForPercent(pct, settings) {
   return 'var(--green)';
 }
 
-function formatResetTime(iso) {
-  if (!iso) return '';
-  const date = new Date(iso);
+function formatResetTime(value) {
+  if (!value) return '';
+  let v = value;
+  if (typeof v === 'string' && /^\d+(\.\d+)?$/.test(v.trim())) v = Number(v.trim());
+  // Bare numbers below ~1e12 are epoch seconds, not milliseconds
+  if (typeof v === 'number' && v < 1e12) v *= 1000;
+  const date = new Date(v);
+  if (Number.isNaN(date.getTime())) return '';
   const now = new Date();
   const diffMs = date - now;
   if (diffMs < 0) return 'Reset elapsed';
