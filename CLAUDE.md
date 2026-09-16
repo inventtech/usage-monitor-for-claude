@@ -19,7 +19,7 @@ Development loop:
 3. Inspect the service worker via the "service worker" link on the extension card;
    inspect the popup via right-click → Inspect on the open popup.
 
-Releasing = bump `"version"` in `manifest.json` by hand (currently 1.6.6).
+Releasing = bump `"version"` in `manifest.json` by hand (currently 1.7.0).
 
 ## Architecture — the one thing to understand
 
@@ -51,6 +51,22 @@ response tree recursively and `extractPercent()` / `extractRaw()` / `extractRese
 probe a long list of candidate key names and tolerate percent-vs-fraction ambiguity.
 When adapting to a new plan, **add key names to those lists** rather than special-casing
 a path. `prettyLabel()` maps raw keys to human labels.
+
+Two deliberate exceptions to the schema-agnostic walk (both since v1.7.0):
+
+- `limits[]`: when the response carries this structured list (`kind`: `session` /
+  `weekly_all` / `weekly_scoped`, plus `percent`, `resets_at`, `scope`), it is parsed by
+  `parseStructuredLimits()` and the walker skips the `limits` subtree. It is the same list
+  the usage page renders and it is the only place a model-scoped weekly window (e.g.
+  "Weekly (Fable)") is exposed.
+- `*_breakdown` keys (`seven_day_breakdown.rows[]`) are **never** windows: their `percent`
+  is the share of the week's usage per product, not utilization of a limit. They are
+  surfaced separately via `extractBreakdown()` -> `usage.breakdown` and must not feed the
+  badge, `maxPercent`, or notifications.
+
+An idle window under a known plan/weekly key (`KNOWN_WINDOW_KEYS`, e.g. `five_hour` at
+`{ utilization: 0, resets_at: null }`) is kept as a real 0%, so the badge always has the
+session window to show.
 
 ### State split
 
