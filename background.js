@@ -1,7 +1,13 @@
 // =========================================================
-// Usage Monitor for Claude - Background Service Worker (v1.6.6)
+// Usage Monitor for Claude - Background Service Worker (v1.7.0)
 // =========================================================
 // Changes:
+//   - v1.7.0: Adapt to the new /usage response shape: parse the structured
+//             `limits[]` list (session / weekly_all / weekly_scoped), stop
+//             reading `seven_day_breakdown` shares as limit utilization
+//             (badge showed "Claude Code: 100%" while idle), keep an idle
+//             0% session window visible, show the weekly per-product
+//             breakdown in the popup as information only.
 //   - v1.6.6: Post-merge review follow-up — persist discovered endpoints,
 //             full discovery sweep (keeps /rate_limits plan tier), trailing
 //             refresh re-run, fetch timeouts, stale-data disclosure in popup,
@@ -184,46 +190,61 @@ function extractRaw(obj) {
 }
 
 /**
- * Map raw keys to human-friendly labels
+ * Raw key -> human-friendly label.
  */
-function prettyLabel(rawLabel) {
-  const mapping = {
-    // Pro/Max plan keys (observed in real /usage responses)
-    'five_hour': '5-Hour Session',
-    'fivehour': '5-Hour Session',
-    'seven_day': 'Weekly (All Models)',
-    'sevenday': 'Weekly (All Models)',
-    'seven_day_sonnet': 'Weekly (Sonnet)',
-    'sevendaysonnet': 'Weekly (Sonnet)',
-    'seven_day_opus': 'Weekly (Opus)',
-    'sevendayopus': 'Weekly (Opus)',
-    'seven_day_haiku': 'Weekly (Haiku)',
-    'seven_day_cowork': 'Weekly (Cowork)',
-    'seven_day_oauth_apps': 'Weekly (OAuth Apps)',
-    'seven_day_omelette': 'Weekly (Skills)',
-    'extra_usage': 'Extra Credits',
+const LABEL_MAP = {
+  // Pro/Max plan keys (observed in real /usage responses)
+  'five_hour': '5-Hour Session',
+  'fivehour': '5-Hour Session',
+  'seven_day': 'Weekly (All Models)',
+  'sevenday': 'Weekly (All Models)',
+  'seven_day_sonnet': 'Weekly (Sonnet)',
+  'sevendaysonnet': 'Weekly (Sonnet)',
+  'seven_day_opus': 'Weekly (Opus)',
+  'sevendayopus': 'Weekly (Opus)',
+  'seven_day_haiku': 'Weekly (Haiku)',
+  'seven_day_cowork': 'Weekly (Cowork)',
+  'seven_day_oauth_apps': 'Weekly (OAuth Apps)',
+  'seven_day_omelette': 'Weekly (Skills)',
+  'extra_usage': 'Extra Credits',
+  'spend': 'Extra Usage',
 
-    // Enterprise/Team keys
-    'current_session': 'Current Session',
-    'session': 'Session',
-    'weekly': 'Weekly',
-    'weekly_opus': 'Weekly (Opus)',
-    'opus_weekly': 'Weekly (Opus)',
-    'all_models': 'Weekly (All Models)',
-    'claude_design': 'Claude Design',
-    'daily': 'Daily',
-    'monthly': 'Monthly',
-    'routine_runs': 'Routine Runs',
-    'daily_routine_runs': 'Daily Routine Runs',
-    'daily_included_routine_runs': 'Daily Routine Runs',
-  };
+  // Enterprise/Team keys
+  'current_session': 'Current Session',
+  'session': 'Session',
+  'weekly': 'Weekly',
+  'weekly_opus': 'Weekly (Opus)',
+  'opus_weekly': 'Weekly (Opus)',
+  'all_models': 'Weekly (All Models)',
+  'claude_design': 'Claude Design',
+  'daily': 'Daily',
+  'monthly': 'Monthly',
+  'routine_runs': 'Routine Runs',
+  'daily_routine_runs': 'Daily Routine Runs',
+  'daily_included_routine_runs': 'Daily Routine Runs',
+};
 
-  const normalized = String(rawLabel)
+// Plan / weekly window keys. A window under one of these keys is real even
+// when idle ({ utilization: 0, resets_at: null }): an unused 5-hour session
+// is "0%", not a placeholder, and must stay visible so the badge can show it
+// instead of falling back to some unrelated high number.
+const KNOWN_WINDOW_KEYS = new Set([
+  'five_hour', 'fivehour', 'current_session', 'session',
+  'seven_day', 'sevenday', 'weekly', 'all_models',
+  'seven_day_sonnet', 'seven_day_opus', 'seven_day_haiku',
+  'seven_day_cowork', 'seven_day_oauth_apps', 'seven_day_omelette',
+]);
+
+function normalizeKey(rawLabel) {
+  return String(rawLabel)
     .toLowerCase()
     .replace(/[\s-]+/g, '_')
     .replace(/^_+|_+$/g, '');
+}
 
-  if (mapping[normalized]) return mapping[normalized];
+function prettyLabel(rawLabel) {
+  const normalized = normalizeKey(rawLabel);
+  if (LABEL_MAP[normalized]) return LABEL_MAP[normalized];
 
   // fallback: snake_case → Title Case
   return String(rawLabel)
@@ -234,9 +255,19 @@ function prettyLabel(rawLabel) {
 /**
  * Walk an object recursively and collect anything that looks like a usage window
  */
-function findUsageWindows(root) {
+function findUsageWindows(root, skipKeys) {
   const windows = [];
   const visited = new WeakSet();
+  const skip = skipKeys instanceof Set ? skipKeys : new Set();
+
+  // Keys whose subtree is never a limit window, at any depth. `*_breakdown`
+  // blocks report the *share* of usage per product (seven_day_breakdown
+  // .rows[].percent), so "Claude Code: 100%" there means "all of this week's
+  // usage came from Claude Code", not "limit reached". Callers also pass
+  // keys they already parsed structurally (see parseStructuredLimits).
+  function isSkippedKey(k) {
+    return skip.has(k) || /(^|_)breakdown$/i.test(k);
+  }
 
   function walk(node, path, parentKey) {
     try {
@@ -256,11 +287,14 @@ function findUsageWindows(root) {
         const raw = extractRaw(node);
         const looksUnused = pct === 0 && !resetsAt && !raw;
         if (looksUnused) {
-          // Keep if it has an explicit name — the user probably wants to see it
+          // Keep if it has an explicit name (the user probably wants to see
+          // it) or sits under a known plan/weekly key (an idle session is a
+          // real 0%). Anything else is a placeholder-like { utilization: 0 }.
           const hasExplicitName = node.name || node.label || node.display_name || node.title;
-          if (!hasExplicitName) {
-            // Skip placeholder-like { utilization: 0 } nodes
+          const isKnownWindow = KNOWN_WINDOW_KEYS.has(normalizeKey(parentKey || ''));
+          if (!hasExplicitName && !isKnownWindow) {
             for (const [k, v] of Object.entries(node)) {
+              if (isSkippedKey(k)) continue;
               walk(v, path ? `${path}.${k}` : k, k);
             }
             return;
@@ -286,6 +320,7 @@ function findUsageWindows(root) {
       }
 
       for (const [k, v] of Object.entries(node)) {
+        if (isSkippedKey(k)) continue;
         walk(v, path ? `${path}.${k}` : k, k);
       }
     } catch (_) { /* ignore one bad subtree */ }
@@ -307,6 +342,85 @@ function findUsageWindows(root) {
   } catch (_) {
     return windows;
   }
+}
+
+/**
+ * claude.ai now ships a structured `limits` list next to the legacy
+ * five_hour / seven_day objects. It is the same list the usage page renders,
+ * with a machine-readable `kind` and an explicit `scope`, so it is preferred
+ * over guessing from key names. Returns null when the response has no such
+ * list (older shape, other plans) so the caller falls back to the walker.
+ *
+ *   { group: 'weekly', kind: 'weekly_scoped', percent: 28,
+ *     resets_at: '...', scope: { model: { display_name: 'Fable' } } }
+ */
+function parseStructuredLimits(data) {
+  if (!data || typeof data !== 'object' || !Array.isArray(data.limits)) return null;
+  const windows = [];
+  data.limits.forEach((item, i) => {
+    try {
+      if (!item || typeof item !== 'object' || typeof item.percent !== 'number') return;
+      const pct = item.percent;
+      if (!isFinite(pct) || pct < 0) return;
+      windows.push({
+        label: structuredLimitLabel(item),
+        rawLabel: String(item.kind || item.group || 'limit'),
+        percent: Math.min(100, Math.round(pct)),
+        resetsAt: extractResetTime(item),
+        raw: null,
+        path: `limits[${i}]`,
+        isActive: item.is_active === true,
+        severity: typeof item.severity === 'string' ? item.severity : null,
+      });
+    } catch (_) { /* skip one bad entry */ }
+  });
+  return windows;
+}
+
+function structuredLimitLabel(item) {
+  const kind = normalizeKey(item.kind || '');
+  const scope = item.scope || {};
+  const scopeName = scope.model?.display_name
+    || scope.surface?.display_name
+    || (typeof scope.surface === 'string' ? scope.surface : null)
+    || (typeof scope.model === 'string' ? scope.model : null);
+  const suffix = scopeName ? ` (${prettyLabel(scopeName)})` : '';
+
+  if (kind === 'session') return '5-Hour Session';
+  if (kind === 'weekly_all') return 'Weekly (All Models)';
+  if (kind === 'weekly_scoped') return scopeName ? `Weekly${suffix}` : 'Weekly (Scoped)';
+  if (kind.startsWith('weekly')) return `Weekly${suffix}`;
+  // Unknown kind: fall back to the generic label mapping
+  return prettyLabel(kind || item.group || 'Limit') + suffix;
+}
+
+/**
+ * Weekly per-product breakdown (seven_day_breakdown.rows[]): the share of
+ * this week's usage each product consumed. Informational only; it is never
+ * treated as a window and never drives the badge or notifications.
+ */
+function extractBreakdown(data) {
+  if (!data || typeof data !== 'object') return null;
+  for (const [key, block] of Object.entries(data)) {
+    if (!/(^|_)breakdown$/i.test(key) || !block || !Array.isArray(block.rows)) continue;
+    const rows = [];
+    for (const r of block.rows) {
+      if (!r || typeof r !== 'object' || typeof r.percent !== 'number' || !isFinite(r.percent)) continue;
+      rows.push({
+        label: String(r.display_name || prettyLabel(r.key || r.name || 'Other')),
+        key: r.key || null,
+        percent: Math.max(0, Math.min(100, Math.round(r.percent))),
+      });
+    }
+    if (!rows.length) continue;
+    return {
+      source: key,
+      rows,
+      asOf: block.as_of || null,
+      windowStartedAt: block.window_started_at || null,
+    };
+  }
+  return null;
 }
 
 function extractPlanName(orgsData, usageData) {
@@ -429,10 +543,15 @@ async function fetchUsage() {
       });
       if (resp.ok) {
         const data = await resp.json();
-        const windows = findUsageWindows(data);
+        // Prefer the structured `limits[]` list when the response has one;
+        // the generic walker then covers everything else (extra usage,
+        // feature-flagged windows) without re-reading the same limits.
+        const structured = parseStructuredLimits(data);
+        const skipKeys = new Set(structured ? ['limits'] : []);
+        const windows = (structured || []).concat(findUsageWindows(data, skipKeys));
         // Tag each window with its origin endpoint (for debugging)
         for (const w of windows) w.fromEndpoint = url;
-        triedResults.push({ endpoint: url, path, data, windows });
+        triedResults.push({ endpoint: url, path, data, windows, breakdown: extractBreakdown(data) });
       } else if (resp.status === 404) {
         gonePaths.add(path);
       } else {
@@ -496,6 +615,8 @@ async function fetchUsage() {
     { match: /weekly[_ ]?\(skills\)|seven[_ ]?day[_ ]?omelette/i, group: 'weekly', order: 15, groupLabel: 'Weekly limits' },
     { match: /weekly[_ ]?\(cowork\)|seven[_ ]?day[_ ]?cowork/i, group: 'weekly', order: 16, groupLabel: 'Weekly limits' },
     { match: /weekly[_ ]?\(oauth/i, group: 'weekly', order: 17, groupLabel: 'Weekly limits' },
+    // Any other scoped weekly window, e.g. "Weekly (Fable)" from limits[].scope
+    { match: /^weekly[_ ]?\(/i, group: 'weekly', order: 18, groupLabel: 'Weekly limits' },
     // Additional features
     { match: /routine[_ ]?runs?|daily/i, group: 'additional', order: 20, groupLabel: 'Additional features' },
     // Extra usage
@@ -549,11 +670,15 @@ async function fetchUsage() {
     triedResults.reduce((acc, r) => ({ ...acc, ...r.data }), {})
   );
 
+  // First endpoint that carries a per-product breakdown wins (only /usage does today)
+  const breakdown = triedResults.map(r => r.breakdown).find(Boolean) || null;
+
   if (windows.length === 0) {
     return {
       planName,
       maxPercent: 0,
       windows: [],
+      breakdown,
       warning: 'No usage windows found in response — please copy raw JSON and send to developer',
       fetchedAt: Date.now(),
     };
@@ -565,6 +690,7 @@ async function fetchUsage() {
     planName,
     maxPercent,
     windows,
+    breakdown,
     fetchedAt: Date.now(),
   };
 }
@@ -614,8 +740,11 @@ function pickBadgeWindow(windows) {
     /5[- ]?hour|five[_ ]?hour|current[_ ]?session|session/i.test(w.rawLabel || w.label)
   );
   if (fiveHour) return fiveHour;
-  // Fallback: window with the highest percent
-  return windows.reduce((a, b) => (a.percent >= b.percent ? a : b));
+  // Fallback: highest-percent *limit* window. Unclassified "other" windows
+  // are unknown fields and must not drive the badge or notifications.
+  const limits = windows.filter(w => w.group && w.group !== 'other');
+  const pool = limits.length ? limits : windows;
+  return pool.reduce((a, b) => (a.percent >= b.percent ? a : b));
 }
 
 async function updateBadge(usage, status, settings) {

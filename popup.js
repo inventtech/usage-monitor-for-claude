@@ -147,6 +147,28 @@ async function renderInternal({ state, settings }) {
           </div>`;
       }
     }
+
+    // Weekly per-product breakdown: the share of this week's usage each
+    // product consumed (rows sum to ~100%). Informational, NOT a limit, so it
+    // gets a neutral bar and never uses the warn/critical colors.
+    const rows = lastUsage.breakdown?.rows;
+    if (Array.isArray(rows) && rows.length) {
+      html += `<div style="margin:10px 0 2px;font-weight:600;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:0.04em;">Weekly usage by product</div>`;
+      html += `<div style="font-size:10px;color:var(--muted);margin-bottom:6px;">Share of this week's usage, not a limit</div>`;
+      for (const r of rows) {
+        const pct = Math.max(0, Math.min(100, Math.round(Number(r.percent) || 0)));
+        html += `
+          <div class="window">
+            <div class="window-row">
+              <span class="window-label">${escapeHtml(r.label)}</span>
+              <span class="window-value" style="color:var(--info)">${pct}%</span>
+            </div>
+            <div class="bar">
+              <div class="bar-fill" style="width:${Math.max(2, pct)}%;background:var(--info)"></div>
+            </div>
+          </div>`;
+      }
+    }
   } else if (lastUsage?.warning || (lastError?.usage && !hasCaptured)) {
     html += `<div class="error" style="background:rgba(245,158,11,0.15);border-left:3px solid var(--yellow);color:var(--fg);">
       <strong>💡 Setup needed</strong><br><br>

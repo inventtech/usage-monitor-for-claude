@@ -12,7 +12,7 @@ badge) and **Anthropic service status**, all in one place.
 - **Auto-refresh** every minute (configurable)
 - **Service status** from status.claude.com — see incidents instantly
 - **Notifications** when usage crosses a threshold or a new incident is reported
-- **Click for details**: 5-hour session, weekly limit, weekly Opus/Sonnet, reset times
+- **Click for details**: 5-hour session, weekly limits (all models and per-model), reset times, and the weekly usage breakdown by product (Claude Code / Chats / Cowork)
 - **Plan-aware** — works with Free, Pro, Max, Team, and Enterprise
 - **No setup** — uses your browser's existing claude.ai session
 
