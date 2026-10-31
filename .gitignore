@@ -3,3 +3,4 @@
 
 # Chrome Web Store packages built locally
 *.zip
+dist/

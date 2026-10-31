@@ -10,7 +10,7 @@ it relies on claude.ai's *internal, undocumented* usage API.
 
 ## Commands
 
-There is **no build, lint, test, or package manager** — files are shipped as-is.
+There is **no build step, lint, test, or package manager** — files are shipped as-is (`scripts/build.sh` only zips them).
 
 Development loop:
 1. `chrome://extensions` → Developer mode → **Load unpacked** → select repo root
@@ -20,6 +20,16 @@ Development loop:
    inspect the popup via right-click → Inspect on the open popup.
 
 Releasing = bump `"version"` in `manifest.json` by hand (currently 1.7.0).
+
+Release pipeline (GitHub Actions):
+- `./scripts/build.sh` → `dist/usage-monitor-for-claude-v<version>.zip` (runtime files only;
+  runs `node --check` and fails if the manifest references an unpackaged file). CI runs it on PRs.
+- `.github/workflows/release.yml`: a push to `main` that changes `manifest.json` to a version
+  with no `v<version>` tag builds, uploads + publishes via the Chrome Web Store API v2, then
+  tags and creates a GitHub release. Not bumping the version = no deploy. Re-run a failed
+  upload with *Run workflow* (workflow_dispatch).
+- Needs repo variable `CWS_EXTENSION_ID` and secrets `CWS_PUBLISHER_ID`, `CWS_CLIENT_ID`,
+  `CWS_CLIENT_SECRET`, `CWS_REFRESH_TOKEN`.
 
 ## Architecture — the one thing to understand
 
