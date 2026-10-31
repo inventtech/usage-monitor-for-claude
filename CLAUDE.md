@@ -19,7 +19,7 @@ Development loop:
 3. Inspect the service worker via the "service worker" link on the extension card;
    inspect the popup via right-click → Inspect on the open popup.
 
-Releasing = bump `"version"` in `manifest.json` by hand (currently 1.7.0).
+Releasing = bump `"version"` in `manifest.json` by hand (currently 1.7.1).
 
 ## Architecture — the one thing to understand
 
@@ -63,6 +63,10 @@ Two deliberate exceptions to the schema-agnostic walk (both since v1.7.0):
   is the share of the week's usage per product, not utilization of a limit. They are
   surfaced separately via `extractBreakdown()` -> `usage.breakdown` and must not feed the
   badge, `maxPercent`, or notifications.
+
+When any response carries `limits[]`, walker windows that classify as `other` (codenamed
+internal keys such as `iguana_necktie`, which the usage page never renders) are dropped.
+A window whose `resets_at` is already in the past is reported as 0% (it has reset).
 
 An idle window under a known plan/weekly key (`KNOWN_WINDOW_KEYS`, e.g. `five_hour` at
 `{ utilization: 0, resets_at: null }`) is kept as a real 0%, so the badge always has the

@@ -1,7 +1,12 @@
 // =========================================================
-// Usage Monitor for Claude - Background Service Worker (v1.7.0)
+// Usage Monitor for Claude - Background Service Worker (v1.7.1)
 // =========================================================
 // Changes:
+//   - v1.7.1: When `limits[]` is present show only what the usage page shows
+//             (weekly + per-model windows): drop codenamed internal fields
+//             such as `iguana_necktie`. A window whose reset time has passed
+//             reads 0% instead of the stale pre-reset figure. Max 20x tier is
+//             labelled "Ultra" like the page.
 //   - v1.7.0: Adapt to the new /usage response shape: parse the structured
 //             `limits[]` list (session / weekly_all / weekly_scoped), stop
 //             reading `seven_day_breakdown` shares as limit utilization
@@ -425,9 +430,19 @@ function extractBreakdown(data) {
 
 function extractPlanName(orgsData, usageData) {
   try {
-    // 1) From rate_limit_tier (found in /rate_limits response)
-    if (typeof usageData?.rate_limit_tier === 'string') {
-      const tier = usageData.rate_limit_tier;
+    // 0) Server-provided display name, when the org carries one
+    const org0 = Array.isArray(orgsData) ? orgsData[0] : orgsData;
+    for (const v of [org0?.plan_display_name, org0?.plan_display_label]) {
+      if (typeof v === 'string' && v.trim()) return v.trim();
+    }
+
+    // 1) From rate_limit_tier (/rate_limits response, or the org itself)
+    const tierSrc = typeof usageData?.rate_limit_tier === 'string'
+      ? usageData.rate_limit_tier : org0?.rate_limit_tier;
+    if (typeof tierSrc === 'string') {
+      const tier = tierSrc;
+      // claude.ai now brands the Max 20x tier as "Ultra"
+      if (/claude_max_20x$/.test(tier)) return 'Ultra';
       // 'default_claude_max_5x' → 'Max (5x)'
       // 'default_claude_pro' → 'Pro'
       // 'default_claude_ai' → 'Free'
@@ -477,6 +492,42 @@ function extractPlanName(orgsData, usageData) {
   } catch (_) {
     return 'Unknown';
   }
+}
+
+// Order windows to match the layout of claude.ai/settings/usage
+// (Plan usage limits → Weekly limits → Additional features → Extra usage)
+// Each window gets a `group` and `sortIndex` so the popup can section them out.
+const ORDER = [
+  // Plan usage limits
+  { match: /^(5[- ]?hour|five[_ ]?hour|current[_ ]?session|session)$/i, group: 'plan', order: 0, groupLabel: 'Plan usage limits' },
+  // Weekly limits
+  { match: /weekly[_ ]?\(all[_ ]?models?\)|^(seven[_ ]?day|weekly|all[_ ]?models?)$/i, group: 'weekly', order: 10, groupLabel: 'Weekly limits' },
+  { match: /weekly[_ ]?\(sonnet\)|seven[_ ]?day[_ ]?sonnet|sonnet[_ ]?only/i, group: 'weekly', order: 11, groupLabel: 'Weekly limits' },
+  { match: /weekly[_ ]?\(opus\)|seven[_ ]?day[_ ]?opus|opus[_ ]?only/i, group: 'weekly', order: 12, groupLabel: 'Weekly limits' },
+  { match: /weekly[_ ]?\(haiku\)|seven[_ ]?day[_ ]?haiku|haiku[_ ]?only/i, group: 'weekly', order: 13, groupLabel: 'Weekly limits' },
+  { match: /claude[_ ]?design/i, group: 'weekly', order: 14, groupLabel: 'Weekly limits' },
+  { match: /weekly[_ ]?\(skills\)|seven[_ ]?day[_ ]?omelette/i, group: 'weekly', order: 15, groupLabel: 'Weekly limits' },
+  { match: /weekly[_ ]?\(cowork\)|seven[_ ]?day[_ ]?cowork/i, group: 'weekly', order: 16, groupLabel: 'Weekly limits' },
+  { match: /weekly[_ ]?\(oauth/i, group: 'weekly', order: 17, groupLabel: 'Weekly limits' },
+  // Any other scoped weekly window, e.g. "Weekly (Fable)" from limits[].scope
+  { match: /^weekly[_ ]?\(/i, group: 'weekly', order: 18, groupLabel: 'Weekly limits' },
+  // Additional features
+  { match: /routine[_ ]?runs?|daily/i, group: 'additional', order: 20, groupLabel: 'Additional features' },
+  // Extra usage
+  { match: /extra[_ ]?(usage|credit)/i, group: 'extra', order: 30, groupLabel: 'Extra usage' },
+];
+
+function classify(w) {
+  const candidates = [w.label, w.rawLabel];
+  for (const rule of ORDER) {
+    for (const c of candidates) {
+      if (c && rule.match.test(c)) {
+        return { group: rule.group, sortIndex: rule.order, groupLabel: rule.groupLabel };
+      }
+    }
+  }
+  // Unknown: put it last under "Other"
+  return { group: 'other', sortIndex: 99, groupLabel: 'Other' };
 }
 
 // -------------------- Usage Fetcher --------------------
@@ -551,7 +602,7 @@ async function fetchUsage() {
         const windows = (structured || []).concat(findUsageWindows(data, skipKeys));
         // Tag each window with its origin endpoint (for debugging)
         for (const w of windows) w.fromEndpoint = url;
-        triedResults.push({ endpoint: url, path, data, windows, breakdown: extractBreakdown(data) });
+        triedResults.push({ endpoint: url, path, data, windows, structured: !!structured, breakdown: extractBreakdown(data) });
       } else if (resp.status === 404) {
         gonePaths.add(path);
       } else {
@@ -599,49 +650,32 @@ async function fetchUsage() {
     allWindows = allWindows.concat(r.windows);
   }
 
-  // Dedup across endpoints — first occurrence wins
-  // Order windows to match the layout of claude.ai/settings/usage
-  // (Plan usage limits → Weekly limits → Additional features → Extra usage)
-  // Each window gets a `group` and `sortIndex` so the popup can section them out.
-  const ORDER = [
-    // Plan usage limits
-    { match: /^(5[- ]?hour|five[_ ]?hour|current[_ ]?session|session)$/i, group: 'plan', order: 0, groupLabel: 'Plan usage limits' },
-    // Weekly limits
-    { match: /weekly[_ ]?\(all[_ ]?models?\)|^(seven[_ ]?day|weekly|all[_ ]?models?)$/i, group: 'weekly', order: 10, groupLabel: 'Weekly limits' },
-    { match: /weekly[_ ]?\(sonnet\)|seven[_ ]?day[_ ]?sonnet|sonnet[_ ]?only/i, group: 'weekly', order: 11, groupLabel: 'Weekly limits' },
-    { match: /weekly[_ ]?\(opus\)|seven[_ ]?day[_ ]?opus|opus[_ ]?only/i, group: 'weekly', order: 12, groupLabel: 'Weekly limits' },
-    { match: /weekly[_ ]?\(haiku\)|seven[_ ]?day[_ ]?haiku|haiku[_ ]?only/i, group: 'weekly', order: 13, groupLabel: 'Weekly limits' },
-    { match: /claude[_ ]?design/i, group: 'weekly', order: 14, groupLabel: 'Weekly limits' },
-    { match: /weekly[_ ]?\(skills\)|seven[_ ]?day[_ ]?omelette/i, group: 'weekly', order: 15, groupLabel: 'Weekly limits' },
-    { match: /weekly[_ ]?\(cowork\)|seven[_ ]?day[_ ]?cowork/i, group: 'weekly', order: 16, groupLabel: 'Weekly limits' },
-    { match: /weekly[_ ]?\(oauth/i, group: 'weekly', order: 17, groupLabel: 'Weekly limits' },
-    // Any other scoped weekly window, e.g. "Weekly (Fable)" from limits[].scope
-    { match: /^weekly[_ ]?\(/i, group: 'weekly', order: 18, groupLabel: 'Weekly limits' },
-    // Additional features
-    { match: /routine[_ ]?runs?|daily/i, group: 'additional', order: 20, groupLabel: 'Additional features' },
-    // Extra usage
-    { match: /extra[_ ]?(usage|credit)/i, group: 'extra', order: 30, groupLabel: 'Extra usage' },
-  ];
-
-  function classify(w) {
-    const candidates = [w.label, w.rawLabel];
-    for (const rule of ORDER) {
-      for (const c of candidates) {
-        if (c && rule.match.test(c)) {
-          return { group: rule.group, sortIndex: rule.order, groupLabel: rule.groupLabel };
-        }
-      }
-    }
-    // Unknown: put it last under "Other"
-    return { group: 'other', sortIndex: 99, groupLabel: 'Other' };
-  }
-
+  const now = Date.now();
   for (const w of allWindows) {
     const c = classify(w);
     w.group = c.group;
     w.sortIndex = c.sortIndex;
     w.groupLabel = c.groupLabel;
+    // A window whose reset time has already passed has reset: nothing has
+    // been used in the new window yet, so it is 0% — not the stale (often
+    // 100%) figure the server still reports until the next request lands.
+    const resetMs = w.resetsAt ? Date.parse(w.resetsAt) : NaN;
+    if (isFinite(resetMs) && resetMs <= now) {
+      w.percent = 0;
+      w.resetsAt = null;
+    }
   }
+
+  // When claude.ai ships the structured `limits[]` list, that list is exactly
+  // what the usage page renders (weekly + per-model windows). Anything the
+  // walker found that does not classify as a known limit is an internal,
+  // codenamed field (e.g. `iguana_necktie`, a hidden dollar cap) the page
+  // never shows — drop it so it cannot fill the popup or fire a 100% alert.
+  if (triedResults.some(r => r.structured)) {
+    allWindows = allWindows.filter(w => w.group !== 'other');
+  }
+
+  // Dedup across endpoints — first occurrence wins
 
   const dedup = new Map();
   for (const w of allWindows) {
