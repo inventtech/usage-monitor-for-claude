@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Build package (syntax + manifest checks)
+        run: ./scripts/build.sh
+      - name: Report whether this PR releases a new version
+        run: |
+          VERSION=$(node -p "require('./manifest.json').version")
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::notice::manifest version $VERSION is already released; merging will NOT deploy. Bump \"version\" in manifest.json to release."
+          else
+            echo "::notice::merging will release v$VERSION to the Chrome Web Store."
+          fi

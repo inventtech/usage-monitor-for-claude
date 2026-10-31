@@ -1,0 +1,119 @@
+name: Release to Chrome Web Store
+
+# Releases when manifest.json on main carries a version that has no
+# v<version> tag yet. Run manually (workflow_dispatch) to retry a failed
+# store upload for the current version.
+on:
+  push:
+    branches: [main]
+    paths: [manifest.json]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      CWS_EXTENSION_ID: ${{ vars.CWS_EXTENSION_ID }}
+      CWS_PUBLISHER_ID: ${{ secrets.CWS_PUBLISHER_ID }}
+      CWS_CLIENT_ID: ${{ secrets.CWS_CLIENT_ID }}
+      CWS_CLIENT_SECRET: ${{ secrets.CWS_CLIENT_SECRET }}
+      CWS_REFRESH_TOKEN: ${{ secrets.CWS_REFRESH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Decide whether to release
+        id: ver
+        run: |
+          VERSION=$(node -p "require('./manifest.json').version")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "tagged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Skip (version already released)
+        if: steps.ver.outputs.tagged == 'true' && github.event_name == 'push'
+        run: echo "::notice::v${{ steps.ver.outputs.version }} already tagged; nothing to release."
+
+      - name: Build package
+        id: build
+        if: steps.ver.outputs.tagged == 'false' || github.event_name == 'workflow_dispatch'
+        run: echo "zip=$(./scripts/build.sh)" >> "$GITHUB_OUTPUT"
+
+      - name: Check store credentials
+        if: steps.build.outcome == 'success'
+        run: |
+          missing=""
+          for v in CWS_EXTENSION_ID CWS_PUBLISHER_ID CWS_CLIENT_ID CWS_CLIENT_SECRET CWS_REFRESH_TOKEN; do
+            [ -n "${!v}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Missing Chrome Web Store config:$missing (repo Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+
+      - name: Upload and publish to Chrome Web Store
+        if: steps.build.outcome == 'success'
+        env:
+          ZIP: ${{ steps.build.outputs.zip }}
+        run: |
+          set -euo pipefail
+          TOKEN=$(curl -fsS https://oauth2.googleapis.com/token \
+            -d client_id="$CWS_CLIENT_ID" \
+            -d client_secret="$CWS_CLIENT_SECRET" \
+            -d refresh_token="$CWS_REFRESH_TOKEN" \
+            -d grant_type=refresh_token | jq -r .access_token)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || { echo "::error::OAuth token exchange failed"; exit 1; }
+          echo "::add-mask::$TOKEN"
+
+          BASE="https://chromewebstore.googleapis.com"
+          ITEM="publishers/$CWS_PUBLISHER_ID/items/$CWS_EXTENSION_ID"
+
+          echo "Uploading $ZIP"
+          RESP=$(curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+            -T "$ZIP" "$BASE/upload/v2/$ITEM:upload")
+          echo "$RESP" | jq .
+          STATE=$(echo "$RESP" | jq -r '.uploadState // empty')
+
+          # Large packages may finish processing asynchronously
+          for i in $(seq 1 20); do
+            [ "$STATE" = "IN_PROGRESS" ] || break
+            sleep 15
+            STATE=$(curl -fsS -H "Authorization: Bearer $TOKEN" \
+              "$BASE/v2/$ITEM:fetchStatus" | jq -r '.lastAsyncUploadState // empty')
+            echo "upload state: $STATE"
+          done
+          [ "$STATE" = "SUCCEEDED" ] || { echo "::error::Upload did not succeed (state: ${STATE:-unknown})"; exit 1; }
+
+          echo "Submitting for review / publishing"
+          PUB=$(curl -sS -X POST -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" -d '{}' "$BASE/v2/$ITEM:publish")
+          echo "$PUB" | jq .
+          if echo "$PUB" | jq -e '.error' >/dev/null; then
+            echo "::error::Publish request failed"; exit 1
+          fi
+
+      - name: Tag and create GitHub release
+        if: steps.build.outcome == 'success' && steps.ver.outputs.tagged == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          ZIP: ${{ steps.build.outputs.zip }}
+        run: |
+          gh release create "v$VERSION" "$ZIP" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes
